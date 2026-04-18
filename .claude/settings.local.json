@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import ast; ast.parse\\(open\\('C:/Claude/Arc/arc.py', encoding='utf-8'\\).read\\(\\)\\); print\\('ast: ok'\\)\")",
+      "Bash(python arc.py)"
+    ]
+  }
+}
