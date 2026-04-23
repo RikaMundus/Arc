@@ -1,273 +1,234 @@
-#!/usr/bin/env python3
-"""Arc - minimal self-evolving AGI harness."""
-import os, sys, re, json, shlex, shutil, subprocess, ast, tempfile
-from datetime import datetime, timezone
-from pathlib import Path
-import urllib.request, urllib.error
+import os
+import sys
+import re
+import json
+import subprocess
+import urllib.request
+import urllib.error
 
-SELF = Path(__file__).resolve()
-MEMORY = SELF.parent / "memory.md"
-BAK = SELF.parent / "arc.py.bak"
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+ARC_DIR = os.path.dirname(os.path.abspath(__file__))
+MEM_PATH = os.path.join(ARC_DIR, "memory.md")
+ARC_PATH = os.path.join(ARC_DIR, "arc.py")
+API_URL = "https://openrouter.ai/api/v1/chat/completions"
+CMD_RE = re.compile(r"^/(\w+)\((.*)\)\s*$", re.MULTILINE)
 
-MEMORY_TEMPLATE = '''## Core
-<!-- Never compacted. System prompt, config, tool definitions. -->
 
-### Config
-API_KEY: {api_key}
-MODEL: anthropic/claude-opus-4.7
+def _die(msg):
+    sys.stderr.write(msg + "\n")
+    sys.exit(1)
 
-### System Prompt
-You are a self-evolving AI agent running inside Arc, a minimal Python harness.
 
-Your state lives in memory.md with two sections:
-- `## Core` - your system prompt, config (API_KEY, MODEL), and tool list. Never compacted.
-- `## Scratch` - the running transcript. Each turn begins with `### [role] <ISO-timestamp>` on its own line. `[assistant]` marks your prior output; `[tool:NAME]` marks results of tools you invoked (suffixed with status `ok`/`err`/`cancelled`); `[user]` is the human; `[system]` is from the harness itself.
+def read_memory():
+    if not os.path.isfile(MEM_PATH):
+        _die(f"memory.md not found in {ARC_DIR}")
+    with open(MEM_PATH, "r", encoding="utf-8") as f:
+        text = f.read()
 
-The entire Scratch is handed to you as a single user-role message; continue from the end as a new assistant turn.
+    core_marker = "## Core"
+    scratch_marker = "## Scratch"
+    ci = text.find(core_marker)
+    si = text.find(scratch_marker)
+    if ci < 0:
+        _die("memory.md missing '## Core' heading")
+    if si < 0:
+        _die("memory.md missing '## Scratch' heading")
+    if si < ci:
+        _die("memory.md has '## Scratch' before '## Core'")
 
-To invoke a tool, write it on its own line, e.g. `/cmd("ls")`. The harness will confirm with the user, execute, and append the result to Scratch. Multiple calls in one turn run sequentially. You may discuss tools in prose by placing them inside triple-backtick code fences - fenced content is ignored by the parser.
+    core = text[ci + len(core_marker):si].lstrip("\n")
+    scratch = text[si + len(scratch_marker):].lstrip("\n")
 
-To extend yourself: edit `arc.py` via `/cmd` with a Python one-liner, then `/restart()`. The harness syntax-checks arc.py and backs it up before reloading; if the check fails, the restart is aborted and you get another turn to fix it.
-
-Args are shell-style (shlex), not Python-style: `/cmd("echo hi")` passes one string. Commas are literal characters, not separators.
-
-### Tools
-- `/cmd(command)` - run a shell command (cmd.exe on Windows, /bin/sh elsewhere). Confirmation required.
-- `/set_key=KEY` - update API_KEY in Core.
-- `/set_model=MODEL` - update MODEL in Core.
-- `/restart()` - reload arc.py. ast-checks and backs up first.
-- `/view()` - print memory.md to the terminal. Output not re-logged to Scratch.
-- `/edit()` - open memory.md in $EDITOR (or notepad). Human-only.
-
-## Scratch
-'''
-
-def load_memory():
-    text = MEMORY.read_text(encoding="utf-8")
-    m = re.search(r"^## Scratch\s*$", text, re.MULTILINE)
-    if not m: return text, ""
-    return text[:m.start()].rstrip() + "\n", text[m.end():].lstrip("\n")
-
-def save_memory(core, scratch):
-    text = core.rstrip() + "\n\n## Scratch\n" + scratch.lstrip("\n")
-    tmp = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=str(MEMORY.parent), delete=False)
-    try: tmp.write(text); tmp.close(); os.replace(tmp.name, str(MEMORY))
-    except Exception:
-        try: os.unlink(tmp.name)
-        except OSError: pass
-        raise
-
-def append_scratch(role, content, status=None):
-    core, scratch = load_memory()
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    hdr = f"### [{role}] {ts}" + (f" {status}" if status else "")
-    sep = "\n" if scratch.strip() else ""
-    save_memory(core, scratch.rstrip() + sep + f"\n{hdr}\n{content}\n")
-
-def get_config(core, key):
-    m = re.search(rf"^\s*{re.escape(key)}:\s*(.*?)\s*$", core, re.MULTILINE)
-    return m.group(1) if m else None
-
-def set_config(core, key, value):
-    pat = re.compile(rf"^(\s*){re.escape(key)}:\s*.*?\s*$", re.MULTILINE)
-    if pat.search(core):
-        return pat.sub(rf"\g<1>{key}: {value}", core, count=1)
-    cfg = re.search(r"^### Config\s*$", core, re.MULTILINE)
-    if cfg:
-        i = cfg.end()
-        return core[:i] + f"\n{key}: {value}" + core[i:]
-    return core + f"\n### Config\n{key}: {value}\n"
-
-FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
-CALL_RE = re.compile(r"^\s*/([a-zA-Z_]\w*)\s*(?:=(.*)|\((.*)\)|)\s*$", re.MULTILINE)
-
-def parse_calls(text):
-    stripped = FENCE_RE.sub("", text)
-    calls = []
-    for m in CALL_RE.finditer(stripped):
-        name, kv, paren = m.group(1), m.group(2), m.group(3)
-        if kv is not None:
-            calls.append((name, "kv", kv.strip()))
-        elif paren is not None:
-            try: args = shlex.split(paren, posix=True)
-            except ValueError: args = [paren]
-            calls.append((name, "call", args))
+    cfg = {"api_key": "", "model": "", "auto_approve": []}
+    for line in core.splitlines():
+        if line.strip() == "":
+            break
+        if ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        k = k.strip()
+        v = v.strip()
+        if k == "auto_approve":
+            try:
+                parsed = json.loads(v) if v else []
+                if not isinstance(parsed, list):
+                    raise ValueError("auto_approve must be a JSON array")
+                cfg[k] = parsed
+            except (json.JSONDecodeError, ValueError) as e:
+                append_scratch(f"### error\nauto_approve not valid JSON array: {e}\n")
+                cfg[k] = []
         else:
-            calls.append((name, "bare", []))
-    return calls
+            cfg[k] = v
 
-SENSITIVE = {"set_key"}
-REDACT_OUTPUT = {"view"}
+    return core, scratch, cfg
 
-def call_repr(name, form, payload, redact=True):
-    if redact and name in SENSITIVE:
-        return f"/{name}=<redacted>"
-    if form == "kv":
-        return f"/{name}={payload}"
-    if form == "call":
-        return f"/{name}(" + " ".join(shlex.quote(a) for a in payload) + ")"
-    return f"/{name}()"
 
-def _payload_str(payload):
-    return (payload if isinstance(payload, str) else " ".join(payload)).strip()
+def append_scratch(text):
+    with open(MEM_PATH, "r", encoding="utf-8") as f:
+        current = f.read()
+    if not current.endswith("\n"):
+        current += "\n"
+    new = current + text
+    if not new.endswith("\n"):
+        new += "\n"
+    tmp = MEM_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(new)
+    os.replace(tmp, MEM_PATH)
 
-def _cmd(payload, from_model):
-    cmd_str = _payload_str(payload)
-    if not cmd_str: return "no command", "err"
-    try:
-        p = subprocess.run(cmd_str, shell=True, capture_output=True, text=True, timeout=300)
-        out = (p.stdout or "") + (("\n[stderr]\n" + p.stderr) if p.stderr else "")
-        return (out.rstrip() or "(no output)"), ("ok" if p.returncode == 0 else "err")
-    except subprocess.TimeoutExpired: return "timeout after 300s", "err"
-    except Exception as e: return f"exception: {e}", "err"
 
-def _set(key_name):
-    def fn(payload, from_model):
-        val = _payload_str(payload)
-        if not val: return f"no {key_name} provided", "err"
-        core, scratch = load_memory()
-        save_memory(set_config(core, key_name, val), scratch)
-        return f"{key_name} updated", "ok"
-    return fn
-
-def _restart(payload, from_model):
-    try: ast.parse(SELF.read_text(encoding="utf-8"))
-    except SyntaxError as e: return f"restart aborted: {e}", "err"
-    try: shutil.copy(str(SELF), str(BAK))
-    except Exception as e: return f"backup failed: {e}", "err"
-    append_scratch("system", "restarting...")
-    print("\n[arc] restarting...\n", flush=True)
-    os.execv(sys.executable, [sys.executable, str(SELF)])
-
-def _view(payload, from_model): return MEMORY.read_text(encoding="utf-8"), "ok"
-
-def _edit(payload, from_model):
-    if from_model: return "/edit is human-only (would block stdin)", "cancelled"
-    editor = os.environ.get("EDITOR") or ("notepad" if os.name == "nt" else "vi")
-    try: subprocess.run([editor, str(MEMORY)]); return f"edited via {editor}", "ok"
-    except Exception as e: return f"editor failed: {e}", "err"
-
-TOOLS = {"cmd": _cmd, "set_key": _set("API_KEY"), "set_model": _set("MODEL"),
-         "restart": _restart, "view": _view, "edit": _edit}
-
-def confirm(cs, batch):
-    if batch.get("all"):
-        return "y"
-    while True:
+def extract_commands(text):
+    out = []
+    for m in CMD_RE.finditer(text):
+        name = m.group(1)
+        inner = m.group(2)
+        raw = m.group(0)
         try:
-            ans = input(f"\n[confirm] {cs}\n  [y]es / [n]o / [a]ll (rest of turn) / [q]uit: ").strip().lower() or "n"
-        except (EOFError, KeyboardInterrupt):
-            return "q"
-        if ans in ("y", "n", "a", "q"):
-            if ans == "a":
-                batch["all"] = True
-                return "y"
-            return ans
+            args = json.loads("[" + inner + "]")
+        except json.JSONDecodeError as e:
+            out.append((name, None, f"{raw} -> {e}"))
+            continue
+        out.append((name, args, raw))
+    return out
 
-class ContextOverflow(Exception): pass
 
-def call_model(core, scratch):
-    api_key = get_config(core, "API_KEY") or ""
-    model = get_config(core, "MODEL") or "anthropic/claude-opus-4.7"
-    if not api_key or api_key == "sk-or-...":
-        raise RuntimeError("API_KEY not set. Use /set_key=sk-or-...")
+def api_call(core, scratch, cfg):
     body = json.dumps({
-        "model": model,
+        "model": cfg.get("model", ""),
         "messages": [
             {"role": "system", "content": core},
-            {"role": "user", "content": scratch or "(scratch empty - begin)"},
+            {"role": "user", "content": scratch},
         ],
     }).encode("utf-8")
-    req = urllib.request.Request(OPENROUTER_URL, data=body, method="POST",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body_text = ""
-        try: body_text = e.read().decode("utf-8", errors="replace")
-        except Exception: pass
-        if e.code == 413 or any(s in body_text.lower() for s in ("context_length", "context length", "too long")):
-            raise ContextOverflow(body_text)
-        raise RuntimeError(f"HTTP {e.code}: {body_text[:500]}")
+    req = urllib.request.Request(
+        API_URL,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {cfg.get('api_key', '')}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req) as resp:
+        raw = resp.read().decode("utf-8")
+    data = json.loads(raw)
     return data["choices"][0]["message"]["content"]
 
-def execute(name, form, payload, from_model):
-    if name not in TOOLS:
-        return f"unknown tool: {name}", "err"
-    return TOOLS[name](payload, from_model)
 
-def run_model_turn():
-    batch = {"all": False}
-    while True:
-        core, scratch = load_memory()
+def confirm_shell(cmd, cfg):
+    for pat in cfg.get("auto_approve", []) or []:
         try:
-            resp = call_model(core, scratch)
-        except ContextOverflow as e:
-            append_scratch("system", f"context overflow - please /compact or trim Scratch.\n{str(e)[:500]}")
-            print("[arc] context overflow; returning to prompt.")
-            return
-        except Exception as e:
-            append_scratch("system", f"api error: {e}")
-            print(f"[arc] api error: {e}")
-            return
-        print("\n" + resp + "\n", flush=True)
-        append_scratch("assistant", resp)
-        calls = parse_calls(resp)
-        if not calls:
-            return
-        for (name, form, payload) in calls:
-            cs = call_repr(name, form, payload)
-            ans = confirm(cs, batch)
-            if ans == "q":
-                append_scratch("system", f"user quit during tool confirmation at {cs}")
-                return
-            if ans == "n":
-                append_scratch(f"tool:{name}", f"{cs}\n(cancelled by user)", status="cancelled")
-                continue
-            out, status = execute(name, form, payload, from_model=True)
-            log_out = "(output not logged)" if name in REDACT_OUTPUT else out
-            append_scratch(f"tool:{name}", f"{cs}\n{log_out}", status=status)
-
-def repl():
-    print("[arc] type a message, or a /command. Ctrl-C to exit.")
-    while True:
-        try:
-            line = input("\n> ").rstrip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n[arc] bye.")
-            return
-        if not line:
+            if re.search(pat, cmd):
+                return True
+        except re.error:
             continue
-        if line.startswith("/"):
-            calls = parse_calls(line)
-            if not calls:
-                print("[arc] didn't parse as a tool call.")
-                continue
-            for (name, form, payload) in calls:
-                cs = call_repr(name, form, payload)
-                out, status = execute(name, form, payload, from_model=False)
-                log_out = "(output not logged)" if name in REDACT_OUTPUT else out
-                append_scratch(f"user-tool:{name}", f"{cs}\n{log_out}", status=status)
-                print(out if name in REDACT_OUTPUT else f"[{status}] {out[:4000]}")
-        else:
-            append_scratch("user", line)
-            run_model_turn()
+    sys.stdout.write(f"/shell: {cmd}\n[y]/n> ")
+    sys.stdout.flush()
+    try:
+        line = input()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return line.strip() == "" or line.strip().lower() == "y"
+
+
+def run_shell(cmd, user_typed, cfg):
+    if not user_typed and not confirm_shell(cmd, cfg):
+        append_scratch(f"### tool:/shell [aborted]\ncmd: {cmd}\n")
+        return
+    try:
+        proc = subprocess.run(
+            cmd,
+            shell=True,
+            cwd=ARC_DIR,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        rc = proc.returncode
+        out = proc.stdout or ""
+        err = proc.stderr or ""
+    except Exception as e:
+        append_scratch(
+            f"### tool:/shell\ncmd: {cmd}\nexit_code: -1\nstdout:\n\nstderr:\n{type(e).__name__}: {e}\n"
+        )
+        return
+    append_scratch(
+        f"### tool:/shell\ncmd: {cmd}\nexit_code: {rc}\nstdout:\n{out}\nstderr:\n{err}\n"
+    )
+
+
+def do_restart():
+    try:
+        with open(ARC_PATH, "rb") as f:
+            src = f.read()
+        compile(src, "arc.py", "exec")
+    except SyntaxError as e:
+        append_scratch(f"### error\nSyntaxError on /restart: {e}\n")
+        return
+    except OSError as e:
+        append_scratch(f"### error\nfailed to read arc.py on /restart: {e}\n")
+        return
+    os.execv(sys.executable, [sys.executable, ARC_PATH])
+
+
+REGISTRY = {
+    "shell": lambda args, ut, cfg: run_shell(args[0] if args else "", ut, cfg),
+    "restart": lambda args, ut, cfg: do_restart(),
+}
+
+
+def dispatch(name, args, raw, user_typed, cfg):
+    if args is None:
+        append_scratch(f"### error\nbad args for /{name}: {raw}\n")
+        return
+    fn = REGISTRY.get(name)
+    if fn is None:
+        append_scratch(f"### error\nunknown command: /{name}\n")
+        return
+    try:
+        fn(args, user_typed, cfg)
+    except Exception as e:
+        append_scratch(f"### error\nhandler for /{name} raised {type(e).__name__}: {e}\n")
+
+
+def stdin_subloop(cfg):
+    while True:
+        line = input()
+        append_scratch(f"### user\n{line}\n")
+        m = CMD_RE.match(line)
+        if not m:
+            return
+        name = m.group(1)
+        inner = m.group(2)
+        try:
+            args = json.loads("[" + inner + "]")
+        except json.JSONDecodeError as e:
+            append_scratch(f"### error\nbad args for /{name}: {line} -> {e}\n")
+            continue
+        dispatch(name, args, line, user_typed=True, cfg=cfg)
+
 
 def main():
-    if not MEMORY.exists():
-        print("[arc] first run. No memory.md found.")
-        try:
-            key = input("Paste OpenRouter API key (sk-or-...), or blank to set later: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            key = ""
-        if not key:
-            key = "sk-or-..."
-        MEMORY.write_text(MEMORY_TEMPLATE.format(api_key=key), encoding="utf-8")
-        print(f"[arc] wrote {MEMORY}.")
-        print("[arc] note: memory.md contains your API key. Do not share or commit it.")
-    repl()
+    try:
+        while True:
+            core, scratch, cfg = read_memory()
+            try:
+                response = api_call(core, scratch, cfg)
+            except (urllib.error.URLError, urllib.error.HTTPError,
+                    TimeoutError, json.JSONDecodeError, KeyError, ValueError) as e:
+                append_scratch(f"### error\n{type(e).__name__}: {e}\n")
+                stdin_subloop(cfg)
+                continue
+            append_scratch(f"### assistant\n{response}\n")
+            cmds = extract_commands(response)
+            if not cmds:
+                stdin_subloop(cfg)
+                continue
+            for name, args, raw in cmds:
+                dispatch(name, args, raw, user_typed=False, cfg=cfg)
+    except (KeyboardInterrupt, EOFError):
+        sys.exit(0)
+
 
 if __name__ == "__main__":
     main()
